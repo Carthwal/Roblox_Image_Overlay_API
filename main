@@ -1,0 +1,839 @@
+-- Ground Image Overlay. Run on the client.
+-- Built-in executor adapter for Metatable-Games/LuauImageParser's pixel-matrix API.
+-- https://github.com/Metatable-Games/LuauImageParser
+local CONFIG = {
+    Parser = nil, -- Optional override, otherwise use the built-in API adapter.
+    ParserModule = nil, -- Optional existing ModuleScript override.
+    APIURL = "https://image-parser.tyrannizerdev.workers.dev",
+    Request = nil, -- Optional function accepting {Url=..., Method="GET"}; returns HTTP response.
+    MaxResponseBytes = 32 * 1024 * 1024,
+    URL = "https://static.wikia.nocookie.net/patric/images/c/ca/200px-Patrick_Star_svg.png/revision/latest/scale-to-width-down/200?cb=20120115202441",
+    Resolution = 1024,
+    MaxCanvasDimension = 4096,
+    RayDistance = 10000,
+    Thickness = 0.05,
+}
+
+local Players = game:GetService("Players")
+local UIS = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local CAS = game:GetService("ContextActionService")
+local HttpService = game:GetService("HttpService")
+local AssetService = game:GetService("AssetService")
+local player = Players.LocalPlayer
+assert(player, "GroundImageOverlay must run on the client.")
+local env = (type(getgenv) == "function" and getgenv()) or shared
+local singletonKey = "__GroundImageOverlayV1"
+if type(env[singletonKey]) == "function" then pcall(env[singletonKey]) end
+
+local alive, heldC, placing, loading = true, false, false, false
+local windowFocused = true
+local connections, actionNames = {}, {}
+local editable, pixels, imageSize, placeBefore, sliderDrag, panelDrag
+local loadVersion = 0
+local sourceURL = CONFIG.URL
+local state = {
+    x = 0, y = 0, z = 0, width = 20, aspect = 1, scale = 1,
+    yaw = 0, offset = 0.08, transparency = 0.25,
+    visible = true, onTop = false, partFallback = false, snap = 0,
+    sharpPixels = true, density = 64,
+}
+local history, future = {}, {}
+local refresh, cleanup, loadImage, commit
+local controls, toggles = {}, {}
+local palette = {
+    panel = Color3.fromRGB(27, 29, 33), field = Color3.fromRGB(42, 45, 51),
+    text = Color3.fromRGB(239, 241, 244), muted = Color3.fromRGB(170, 178, 190),
+    accent = Color3.fromRGB(75, 196, 169), error = Color3.fromRGB(255, 132, 128),
+}
+local function connect(signal, callback)
+    local connection = signal:Connect(callback)
+    table.insert(connections, connection)
+    return connection
+end
+local function make(className, props, parent)
+    local object = Instance.new(className)
+    for key, value in pairs(props) do object[key] = value end
+    object.Parent = parent
+    return object
+end
+local function clone(value)
+    local result = {}
+    for key, item in pairs(value) do result[key] = item end
+    return result
+end
+local function same(a, b)
+    for key, value in pairs(a) do if b[key] ~= value then return false end end
+    return true
+end
+local function record(before)
+    if same(before, state) then return end
+    table.insert(history, before)
+    if #history > 60 then table.remove(history, 1) end
+    future = {}
+end
+local function finite(value)
+    return type(value) == "number" and value == value and math.abs(value) < math.huge
+end
+local function isEditableImage(value)
+    -- EditableImage inherits Object, so do not require typeof(value) == "Instance".
+    local ok, matches = pcall(function() return value:IsA("EditableImage") end)
+    return ok and matches
+end
+local limits = {
+    x = {-1000000, 1000000}, y = {-1000000, 1000000}, z = {-1000000, 1000000},
+    width = {0.1, 1000}, aspect = {0.05, 20}, scale = {0.01, 100},
+    yaw = {-36000, 36000}, offset = {-1000, 1000}, transparency = {0, 1}, snap = {0, 1000},
+    density = {8, 256},
+}
+local function constrain(key, value)
+    local range = limits[key]
+    return math.clamp(value, range[1], range[2])
+end
+
+local folder = make("Folder", {Name = "GroundImageOverlay_Client"}, workspace)
+local plane = make("Part", {
+    Name = "ImagePlane", Anchored = true, CanCollide = false, CanTouch = false,
+    CanQuery = false, CastShadow = false, Transparency = 1,
+}, folder)
+local surface = make("SurfaceGui", {
+    Name = "ImageSurface", Face = Enum.NormalId.Front,
+    SizingMode = Enum.SurfaceGuiSizingMode.PixelsPerStud, PixelsPerStud = 64,
+    LightInfluence = 0, Brightness = 1, AlwaysOnTop = false, MaxDistance = CONFIG.RayDistance,
+}, plane)
+local image = make("ImageLabel", {
+    Name = "Overlay", Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1,
+    ScaleType = Enum.ScaleType.Stretch, ImageColor3 = Color3.new(1, 1, 1),
+}, surface)
+
+local gui = make("ScreenGui", {
+    Name = "GroundImageOverlay_UI", ResetOnSpawn = false, IgnoreGuiInset = true,
+    DisplayOrder = 1000, ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+}, player:WaitForChild("PlayerGui"))
+local panel = make("Frame", {
+    Name = "Panel", Position = UDim2.fromOffset(24, 70), Size = UDim2.fromOffset(380, 650),
+    BackgroundColor3 = palette.panel, BorderSizePixel = 0, Active = true,
+}, gui)
+make("UICorner", {CornerRadius = UDim.new(0, 6)}, panel)
+local header = make("Frame", {
+    Size = UDim2.new(1, 0, 0, 42), BackgroundTransparency = 1, Active = true,
+}, panel)
+local function label(parent, text, size, position)
+    return make("TextLabel", {
+        Text = text, Font = Enum.Font.Gotham, TextSize = 13, TextColor3 = palette.text,
+        BackgroundTransparency = 1, TextXAlignment = Enum.TextXAlignment.Left,
+        TextWrapped = true,
+        Size = size, Position = position or UDim2.new(),
+    }, parent)
+end
+local function button(parent, text, size, position, callback)
+    local object = make("TextButton", {
+        Text = text, Font = Enum.Font.GothamMedium, TextSize = 13,
+        TextColor3 = palette.text, BackgroundColor3 = palette.field,
+        BorderSizePixel = 0, Size = size, Position = position or UDim2.new(),
+        AutoButtonColor = true, TextWrapped = true,
+    }, parent)
+    make("UICorner", {CornerRadius = UDim.new(0, 4)}, object)
+    connect(object.Activated, callback)
+    return object
+end
+local function textbox(parent, text, size, position)
+    local object = make("TextBox", {
+        Text = text, Font = Enum.Font.Code, TextSize = 13, TextColor3 = palette.text,
+        BackgroundColor3 = palette.field, BorderSizePixel = 0, ClearTextOnFocus = false,
+        Size = size, Position = position or UDim2.new(),
+    }, parent)
+    make("UICorner", {CornerRadius = UDim.new(0, 4)}, object)
+    return object
+end
+label(header, "GROUND IMAGE", UDim2.new(1, -105, 1, 0), UDim2.fromOffset(14, 0)).Font = Enum.Font.GothamBold
+local collapsed = false
+local collapseButton = button(header, "-", UDim2.fromOffset(28, 28), UDim2.new(1, -72, 0, 7), function()
+    collapsed = not collapsed
+    refresh()
+end)
+button(header, "X", UDim2.fromOffset(28, 28), UDim2.new(1, -38, 0, 7), function() cleanup() end)
+local scroll = make("ScrollingFrame", {
+    Position = UDim2.fromOffset(0, 42), Size = UDim2.new(1, 0, 1, -114),
+    BackgroundTransparency = 1, BorderSizePixel = 0, ScrollBarThickness = 4,
+    ScrollBarImageColor3 = palette.muted, AutomaticCanvasSize = Enum.AutomaticSize.Y,
+    CanvasSize = UDim2.new(), ScrollingDirection = Enum.ScrollingDirection.Y,
+}, panel)
+make("UIPadding", {
+    PaddingLeft = UDim.new(0, 14), PaddingRight = UDim.new(0, 14), PaddingBottom = UDim.new(0, 14),
+}, scroll)
+make("UIListLayout", {Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder}, scroll)
+local rowOrder = 0
+local function row(height)
+    rowOrder = rowOrder + 1
+    return make("Frame", {
+        Size = UDim2.new(1, 0, 0, height), BackgroundTransparency = 1, LayoutOrder = rowOrder,
+    }, scroll)
+end
+local function section(text)
+    local object = label(row(25), text, UDim2.fromScale(1, 1))
+    object.TextColor3 = palette.accent
+    object.Font = Enum.Font.GothamBold
+end
+local footer = make("Frame", {
+    Position = UDim2.new(0, 14, 1, -68), Size = UDim2.new(1, -28, 0, 60), BackgroundTransparency = 1,
+}, panel)
+local status = label(footer, "Ready", UDim2.new(1, 0, 0, 36))
+status.TextWrapped = true
+status.TextSize = 12
+local dimensions = label(footer, "", UDim2.new(1, 0, 0, 20), UDim2.fromOffset(0, 38))
+dimensions.TextColor3 = palette.muted
+dimensions.TextSize = 11
+local function notify(text, bad)
+    if not alive then return end
+    status.Text = text
+    status.TextColor3 = bad and palette.error or palette.muted
+end
+local function over(object, point)
+    if not object.Visible then return false end
+    local p, s = object.AbsolutePosition, object.AbsoluteSize
+    return point.X >= p.X and point.X < p.X + s.X and point.Y >= p.Y and point.Y < p.Y + s.Y
+end
+local function overUI(point)
+    return panel.Visible and over(panel, point)
+end
+local panelCursor = make("Frame", {
+    Name = "PanelCursor", Size = UDim2.fromOffset(20, 20), AnchorPoint = Vector2.new(0.5, 0.5),
+    BackgroundTransparency = 1, BorderSizePixel = 0, Visible = false,
+    Active = false, Selectable = false, ZIndex = 100,
+}, gui)
+for _, size in ipairs({UDim2.fromOffset(20, 2), UDim2.fromOffset(2, 20)}) do
+    local arm = make("Frame", {
+        Size = size, AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
+        BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0,
+        Active = false, Selectable = false, ZIndex = 101,
+    }, panelCursor)
+    make("UIStroke", {Color = Color3.new(0, 0, 0), Thickness = 1}, arm)
+end
+local function updatePanelCursor()
+    local point = UIS:GetMouseLocation()
+    panelCursor.Visible = alive and windowFocused and UIS.MouseEnabled and gui.Enabled and overUI(point)
+    if panelCursor.Visible then panelCursor.Position = UDim2.fromOffset(point.X, point.Y) end
+end
+local function cursorRay()
+    local camera = workspace.CurrentCamera
+    if not camera then return nil end
+    local point = UIS:GetMouseLocation()
+    return camera:ViewportPointToRay(point.X, point.Y)
+end
+local function raycast(origin, direction)
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    local excluded = {folder}
+    if player.Character then table.insert(excluded, player.Character) end
+    params.FilterDescendantsInstances = excluded
+    params.IgnoreWater = false
+    return workspace:Raycast(origin, direction, params)
+end
+local function snapped(value)
+    return state.snap > 0 and math.round(value / state.snap) * state.snap or value
+end
+local function setPosition(position)
+    state.x, state.y, state.z = snapped(position.X), position.Y, snapped(position.Z)
+end
+local function groundAt(position)
+    return raycast(position + Vector3.new(0, 128, 0), Vector3.new(0, -CONFIG.RayDistance, 0))
+end
+
+section("IMAGE")
+local sourceRow = row(32)
+local urlBox = textbox(sourceRow, sourceURL, UDim2.new(1, -77, 1, 0))
+urlBox.TextXAlignment = Enum.TextXAlignment.Left
+make("UIPadding", {PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8)}, urlBox)
+local loadButton = button(sourceRow, "Load", UDim2.fromOffset(69, 32), UDim2.new(1, -69, 0, 0), function()
+    loadImage(urlBox.Text)
+end)
+local resolutionRow = row(30)
+label(resolutionRow, "Max pixels", UDim2.new(0.42, 0, 1, 0))
+local resolutionBox = textbox(resolutionRow, tostring(CONFIG.Resolution), UDim2.new(0.28, -4, 1, 0), UDim2.fromScale(0.42, 0))
+button(resolutionRow, "Reload", UDim2.new(0.3, -4, 1, 0), UDim2.new(0.7, 4, 0, 0), function() loadImage(sourceURL) end)
+connect(resolutionBox.FocusLost, function()
+    local value = tonumber(resolutionBox.Text)
+    if finite(value) then CONFIG.Resolution = math.floor(math.clamp(value, 16, 1024)) end
+    resolutionBox.Text = tostring(CONFIG.Resolution)
+end)
+local previewRow = row(110)
+local preview = make("ImageLabel", {
+    Name = "Preview", Size = UDim2.fromOffset(110, 110), BackgroundColor3 = palette.field,
+    BorderSizePixel = 0, ScaleType = Enum.ScaleType.Fit,
+}, previewRow)
+local swatch = make("Frame", {
+    Position = UDim2.fromOffset(122, 0), Size = UDim2.fromOffset(24, 24),
+    BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0,
+}, previewRow)
+local hexBox = textbox(previewRow, "#FFFFFF", UDim2.new(1, -155, 0, 26), UDim2.fromOffset(154, 0))
+local sampleLabel = label(previewRow, "No pixel selected", UDim2.new(1, -122, 0, 42), UDim2.fromOffset(122, 31))
+sampleLabel.TextWrapped = true
+sampleLabel.TextColor3 = palette.muted
+local lastHex = "#FFFFFF"
+local clipboard = env.setclipboard or env.toclipboard or setclipboard or toclipboard
+local function copyText(text, success)
+    if type(clipboard) == "function" then
+        local ok = pcall(clipboard, text)
+        if ok then notify(success or "Copied to clipboard") return true end
+    end
+    notify("Clipboard unavailable. Select the text and copy manually.", true)
+    return false
+end
+button(previewRow, "Copy HEX", UDim2.new(1, -122, 0, 28), UDim2.fromOffset(122, 82), function()
+    copyText(lastHex, "Copied " .. lastHex)
+end)
+
+local function numeric(key, title, step, sliderMin, sliderMax)
+    local object = row(sliderMin and 52 or 30)
+    label(object, title, UDim2.new(0.43, 0, 0, 30))
+    local minus = button(object, "-", UDim2.fromOffset(25, 28), UDim2.new(0.43, 0, 0, 1), function()
+        commit(function() state[key] = constrain(key, state[key] - step) end)
+    end)
+    local field = textbox(object, "", UDim2.new(0.57, -62, 0, 28), UDim2.new(0.43, 31, 0, 1))
+    button(object, "+", UDim2.fromOffset(25, 28), UDim2.new(1, -25, 0, 1), function()
+        commit(function() state[key] = constrain(key, state[key] + step) end)
+    end)
+    controls[key] = {field = field}
+    connect(field.FocusLost, function()
+        local value = tonumber(field.Text)
+        if not finite(value) then notify("Enter a finite number for " .. title, true) refresh() return end
+        commit(function() state[key] = constrain(key, value) end)
+    end)
+    if sliderMin then
+        local track = make("TextButton", {
+            Text = "", Position = UDim2.fromOffset(0, 37), Size = UDim2.new(1, 0, 0, 12),
+            BackgroundColor3 = palette.field, BorderSizePixel = 0, AutoButtonColor = false,
+        }, object)
+        local fill = make("Frame", {Size = UDim2.new(), BackgroundColor3 = palette.accent, BorderSizePixel = 0}, track)
+        controls[key].fill = fill
+        controls[key].min, controls[key].max = sliderMin, sliderMax
+        local function slide(point)
+            local fraction = math.clamp((point.X - track.AbsolutePosition.X) / math.max(1, track.AbsoluteSize.X), 0, 1)
+            state[key] = constrain(key, sliderMin + fraction * (sliderMax - sliderMin))
+            refresh()
+        end
+        connect(track.InputBegan, function(input)
+            if input.UserInputType ~= Enum.UserInputType.MouseButton1 and input.UserInputType ~= Enum.UserInputType.Touch then return end
+            sliderDrag = {before = clone(state), update = slide, input = input}
+            slide(Vector2.new(input.Position.X, input.Position.Y))
+        end)
+    end
+    return minus
+end
+local function toggle(key, title)
+    local object = row(30)
+    local box = button(object, "", UDim2.fromOffset(26, 26), UDim2.fromOffset(0, 2), function()
+        commit(function() state[key] = not state[key] end)
+    end)
+    label(object, title, UDim2.new(1, -36, 1, 0), UDim2.fromOffset(36, 0))
+    toggles[key] = box
+end
+local function commands(items)
+    local object = row(31)
+    for index, item in ipairs(items) do
+        button(object, item[1], UDim2.new(1 / #items, -6, 1, 0), UDim2.new((index - 1) / #items, 0, 0, 0), item[2])
+    end
+end
+section("SIZE & APPEARANCE")
+numeric("width", "Base width (studs)", 1)
+numeric("scale", "Scale", 0.1, 0.1, 5)
+numeric("aspect", "Aspect (width / height)", 0.05)
+commands({
+    {"Original ratio", function()
+        if imageSize then commit(function() state.aspect = constrain("aspect", imageSize.X / imageSize.Y) end) end
+    end},
+    {"1:1", function() commit(function() state.aspect = 1 end) end},
+    {"16:9", function() commit(function() state.aspect = 16 / 9 end) end},
+})
+numeric("yaw", "Rotation (degrees)", 5, 0, 360)
+numeric("transparency", "Transparency", 0.05, 0, 1)
+toggle("visible", "Image visible")
+toggle("onTop", "Render through objects")
+toggle("sharpPixels", "Sharp pixels")
+numeric("density", "Render pixels / stud", 8, 16, 128)
+section("POSITION")
+numeric("x", "X (studs)", 1)
+numeric("y", "Ground Y (studs)", 0.1)
+numeric("z", "Z (studs)", 1)
+numeric("offset", "Y offset (studs)", 0.01, -1, 3)
+numeric("snap", "XZ grid snap (0 = off)", 0.5)
+local function cancelPlace()
+    if not placing then return end
+    placing = false
+    if placeBefore then state = placeBefore end
+    placeBefore = nil
+    refresh()
+    notify("Placement canceled")
+end
+local function beginPlace()
+    if placing then cancelPlace() return end
+    placeBefore = clone(state)
+    placing = true
+    notify("Placement active: click ground to confirm; Escape to cancel.")
+end
+local function underPlayer()
+    local root = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+    if not root then notify("Character not available", true) return end
+    local hit = groundAt(root.Position)
+    if not hit then notify("No ground found below character", true) return end
+    commit(function() setPosition(hit.Position) end)
+end
+commands({{"Place [P]", beginPlace}, {"Under player", underPlayer}})
+commands({
+    {"Snap to ground", function()
+        local hit = groundAt(Vector3.new(state.x, state.y, state.z))
+        if hit then commit(function() state.y = hit.Position.Y end) else notify("No ground found", true) end
+    end},
+    {"Rotate 90", function() commit(function() state.yaw = (state.yaw + 90) % 360 end) end},
+})
+section("TOOLS")
+toggle("partFallback", "E: use part base color outside image")
+local function undo()
+    if placing then cancelPlace() return end
+    if #history == 0 then return end
+    table.insert(future, clone(state))
+    state = table.remove(history)
+    refresh()
+end
+local function redo()
+    if placing then cancelPlace() end
+    if #future == 0 then return end
+    table.insert(history, clone(state))
+    state = table.remove(future)
+    refresh()
+end
+commands({{"Undo", undo}, {"Redo", redo}, {"Reset", function()
+    commit(function()
+        state.width, state.scale = 20, 1
+        state.aspect = imageSize and constrain("aspect", imageSize.X / imageSize.Y) or 1
+        state.yaw, state.offset, state.transparency = 0, 0.08, 0.25
+        state.visible, state.onTop, state.snap = true, false, 0
+        state.sharpPixels, state.density = true, 64
+    end)
+end}})
+local settingsBox = textbox(row(70), "", UDim2.fromScale(1, 1))
+settingsBox.MultiLine = true
+settingsBox.TextWrapped = true
+settingsBox.TextXAlignment = Enum.TextXAlignment.Left
+settingsBox.TextYAlignment = Enum.TextYAlignment.Top
+settingsBox.PlaceholderText = "Settings JSON"
+make("UIPadding", {PaddingTop = UDim.new(0, 6), PaddingLeft = UDim.new(0, 6), PaddingRight = UDim.new(0, 6)}, settingsBox)
+local function importSettings()
+    if loading then notify("Wait for the image load to finish", true) return end
+    local ok, payload = pcall(HttpService.JSONDecode, HttpService, settingsBox.Text)
+    if not ok or type(payload) ~= "table" or payload.version ~= 1 or type(payload.transform) ~= "table" then
+        notify("Invalid settings JSON (expected version 1)", true) return
+    end
+    local nextState = clone(state)
+    for key, value in pairs(nextState) do
+        local supplied = payload.transform[key]
+        if supplied ~= nil then
+            if type(value) == "boolean" then
+                if type(supplied) ~= "boolean" then notify("Invalid setting: " .. key, true) return end
+                nextState[key] = supplied
+            else
+                if not finite(supplied) then notify("Invalid number: " .. key, true) return end
+                nextState[key] = constrain(key, supplied)
+            end
+        end
+    end
+    if type(payload.url) == "string" and payload.url ~= sourceURL then
+        loadImage(payload.url, nextState)
+    else
+        commit(function() state = nextState end)
+        notify("Settings imported")
+    end
+end
+commands({
+    {"Export", function()
+        settingsBox.Text = HttpService:JSONEncode({version = 1, url = sourceURL, transform = state})
+        copyText(settingsBox.Text, "Settings exported and copied")
+    end},
+    {"Import", importSettings},
+})
+
+local function fitPanel()
+    local camera = workspace.CurrentCamera
+    if not camera then return end
+    local viewport = camera.ViewportSize
+    local width, height = math.min(380, math.max(200, viewport.X - 24)), math.min(650, math.max(160, viewport.Y - 48))
+    panel.Size = UDim2.fromOffset(width, collapsed and 42 or height)
+    local previewWidth = width < 310 and 72 or 110
+    local sampleLeft = previewWidth + 12
+    preview.Size = UDim2.fromOffset(previewWidth, previewWidth)
+    swatch.Position = UDim2.fromOffset(sampleLeft, 0)
+    hexBox.Position = UDim2.fromOffset(sampleLeft + 32, 0)
+    hexBox.Size = UDim2.new(1, -sampleLeft - 32, 0, 26)
+    sampleLabel.Position = UDim2.fromOffset(sampleLeft, 31)
+    sampleLabel.Size = UDim2.new(1, -sampleLeft, 0, 42)
+    local copyButton = previewRow:FindFirstChildWhichIsA("TextButton")
+    copyButton.Position = UDim2.fromOffset(sampleLeft, 82)
+    copyButton.Size = UDim2.new(1, -sampleLeft, 0, 28)
+    scroll.Visible, footer.Visible = not collapsed, not collapsed
+    local position = panel.Position
+    panel.Position = UDim2.fromOffset(
+        math.clamp(position.X.Offset, 0, math.max(0, viewport.X - width)),
+        math.clamp(position.Y.Offset, 0, math.max(0, viewport.Y - panel.Size.Y.Offset))
+    )
+end
+local function effectiveRenderDensity(width, height, sourceSize, requested)
+    local sourceDensity = sourceSize and math.max(sourceSize.X / width, sourceSize.Y / height) or 0
+    -- Keep at least the source detail where possible and bound the render canvas.
+    return math.min(math.max(requested, sourceDensity), CONFIG.MaxCanvasDimension / math.max(width, height))
+end
+refresh = function()
+    if not alive then return end
+    local width = math.clamp(state.width * state.scale, 0.1, 2048)
+    local height = math.clamp(width / state.aspect, 0.1, 2048)
+    plane.Size = Vector3.new(width, height, CONFIG.Thickness)
+    -- Local -Z faces upward; local X/Y are the image's right/up axes.
+    local angle = math.rad(state.yaw)
+    local right = Vector3.new(math.cos(angle), 0, -math.sin(angle))
+    local up = Vector3.new(math.sin(angle), 0, math.cos(angle))
+    local center = Vector3.new(state.x, state.y + state.offset - CONFIG.Thickness / 2, state.z)
+    plane.CFrame = CFrame.fromMatrix(center, right, up, Vector3.new(0, -1, 0))
+    surface.Enabled = editable ~= nil and state.visible and not heldC
+    surface.AlwaysOnTop = state.onTop
+    surface.PixelsPerStud = effectiveRenderDensity(width, height, imageSize, state.density)
+    local resampling = state.sharpPixels and Enum.ResamplerMode.Pixelated or Enum.ResamplerMode.Default
+    image.ResampleMode = resampling
+    preview.ResampleMode = resampling
+    image.ImageTransparency = state.transparency
+    for key, control in pairs(controls) do
+        if not control.field:IsFocused() then control.field.Text = string.format("%.4f", state[key]):gsub("0+$", ""):gsub("%.$", "") end
+        if control.fill then
+            local fraction = math.clamp((state[key] - control.min) / (control.max - control.min), 0, 1)
+            control.fill.Size = UDim2.fromScale(fraction, 1)
+        end
+    end
+    for key, box in pairs(toggles) do
+        box.Text = state[key] and "X" or ""
+        box.BackgroundColor3 = state[key] and palette.accent or palette.field
+    end
+    collapseButton.Text = collapsed and "+" or "-"
+    dimensions.Text = string.format("%.2f x %.2f studs | %s", width, height,
+        imageSize and string.format("%d x %d px", imageSize.X, imageSize.Y) or "No image")
+    fitPanel()
+end
+commit = function(change)
+    if placing then cancelPlace() end
+    local before = clone(state)
+    change()
+    record(before)
+    refresh()
+end
+
+local function fetchMatrixJSON(url)
+    local requestFunction = CONFIG.Request or env.request or env.http_request or request or http_request
+    local synTable = env.syn or syn
+    local httpTable = env.http or http
+    if type(requestFunction) ~= "function" and type(synTable) == "table" then requestFunction = synTable.request end
+    if type(requestFunction) ~= "function" and type(httpTable) == "table" then requestFunction = httpTable.request end
+    local body
+    if type(requestFunction) == "function" then
+        local response = requestFunction({Url = url, Method = "GET", Timeout = 30})
+        assert(type(response) == "table", "HTTP function returned an invalid response")
+        local code = tonumber(response.StatusCode or response.Status)
+        assert(code and code >= 200 and code < 300, "Image API HTTP " .. tostring(code or "unknown"))
+        body = response.Body
+    else
+        local ok, result = pcall(function() return game:HttpGet(url) end)
+        if ok then body = result
+        else
+            local httpOK, response = pcall(HttpService.RequestAsync, HttpService, {Url = url, Method = "GET"})
+            assert(httpOK and type(response) == "table" and response.Success,
+                "HTTP unavailable. Your executor needs request/http_request or game:HttpGet support.")
+            body = response.Body
+        end
+    end
+    assert(type(body) == "string" and #body > 0, "Image API returned an empty body")
+    assert(#body <= CONFIG.MaxResponseBytes, "Image API response too large; use a smaller source image")
+    local ok, data = pcall(HttpService.JSONDecode, HttpService, body)
+    assert(ok and type(data) == "table", "Image API returned invalid JSON")
+    assert(not data.error, "Image API: " .. tostring(data.error))
+    return data
+end
+local function matrixToBuffer(data, maxPixels)
+    assert(type(data) == "table", "Image API returned invalid matrix data")
+    local w, h = data.width, data.height
+    assert(finite(w) and finite(h) and w >= 1 and h >= 1 and w % 1 == 0 and h % 1 == 0,
+        "Image API returned invalid dimensions")
+    assert(w * h <= 8000000 and type(data.pixels) == "table", "Image API matrix is invalid or too large")
+    assert(finite(maxPixels), "Invalid resize limit")
+    local limit = math.floor(math.clamp(maxPixels, 1, 1024))
+    -- Published worker ignores resize; bound EditableImage dimensions locally.
+    local factor = math.min(1, limit / math.max(w, h))
+    local width, height = math.max(1, math.floor(w * factor)), math.max(1, math.floor(h * factor))
+    local output = buffer.create(width * height * 4)
+    for y = 0, height - 1 do
+        local sourceY = math.min(h, math.floor((y + 0.5) * h / height) + 1)
+        local row = data.pixels[sourceY]
+        assert(type(row) == "table", "Image API matrix has a missing row")
+        for x = 0, width - 1 do
+            local sourceX = math.min(w, math.floor((x + 0.5) * w / width) + 1)
+            local pixel = row[sourceX]
+            assert(type(pixel) == "table", "Image API matrix has a missing pixel")
+            local index = (y * width + x) * 4
+            for channel = 1, 4 do
+                local value = channel == 4 and (pixel[4] or 255) or pixel[channel]
+                assert(finite(value) and value >= 0 and value <= 255, "Image API returned an invalid color channel")
+                buffer.writeu8(output, index + channel - 1, math.round(value))
+            end
+        end
+    end
+    return output, Vector2.new(width, height)
+end
+local builtinParser = {}
+function builtinParser:GetPixelMatrix(url, resize)
+    local endpoint = CONFIG.APIURL:gsub("/+$", "")
+    assert(endpoint:match("^https?://"), "Invalid image API endpoint")
+    return fetchMatrixJSON(endpoint .. "/?url=" .. HttpService:UrlEncode(url) .. "&resize=" .. tostring(resize))
+end
+function builtinParser:CreateEditableImageFromMatrix(data, maxPixels)
+    local pixelBuffer, size = matrixToBuffer(data, maxPixels or CONFIG.Resolution)
+    local candidate = AssetService:CreateEditableImage({Size = size})
+    assert(candidate, "EditableImage memory budget exhausted; lower Max pixels")
+    local ok, err = pcall(candidate.WritePixelsBuffer, candidate, Vector2.zero, size, pixelBuffer)
+    if not ok then candidate:Destroy() error(tostring(err), 0) end
+    return candidate
+end
+function builtinParser:ParseImageToEditableImage(url, resize)
+    return self:CreateEditableImageFromMatrix(self:GetPixelMatrix(url, resize), resize)
+end
+local function resolveParser()
+    local parser = CONFIG.Parser or env.ImageParser
+    if not parser and CONFIG.ParserModule then parser = require(CONFIG.ParserModule) end
+    if not parser and typeof(script) == "Instance" then
+        local module = script:FindFirstChild("ImageParser")
+        if module and module:IsA("ModuleScript") then parser = require(module) end
+    end
+    parser = parser or builtinParser
+    assert(type(parser) == "table" and type(parser.ParseImageToEditableImage) == "function", "Invalid ImageParser override")
+    return parser
+end
+loadImage = function(url, importedState)
+    if loading then notify("An image is already loading", true) return end
+    url = tostring(url):match("^%s*(.-)%s*$")
+    if not url:match("^https?://") then notify("Enter an http:// or https:// image URL", true) return end
+    loading = true
+    loadVersion = loadVersion + 1
+    local version = loadVersion
+    local resolution = CONFIG.Resolution
+    loadButton.Text = "..."
+    notify("Loading image...")
+    task.spawn(function()
+        local ok, result = pcall(function()
+            return resolveParser():ParseImageToEditableImage(url, resolution)
+        end)
+        if not alive or version ~= loadVersion then
+            if ok and isEditableImage(result) then result:Destroy() end
+            return
+        end
+        loading = false
+        loadButton.Text = "Load"
+        if not ok or not isEditableImage(result) then
+            local message = ok and "Parser returned no EditableImage" or tostring(result)
+            warn("GroundImageOverlay: " .. message)
+            notify(message, true)
+            return
+        end
+        local candidate = result
+        local readOK, newPixels = pcall(candidate.ReadPixelsBuffer, candidate, Vector2.zero, candidate.Size)
+        local renderOK, renderError = pcall(function()
+            local content = Content.fromObject(candidate)
+            image.ImageContent = content
+            preview.ImageContent = content
+        end)
+        if not renderOK then
+            if editable then
+                pcall(function()
+                    image.ImageContent = Content.fromObject(editable)
+                    preview.ImageContent = Content.fromObject(editable)
+                end)
+            else
+                image.Image = ""
+                preview.Image = ""
+            end
+            candidate:Destroy()
+            notify("ImageContent unavailable: " .. tostring(renderError), true)
+            return
+        end
+        local old = editable
+        editable, pixels, imageSize = candidate, readOK and newPixels or nil, candidate.Size
+        sourceURL, urlBox.Text = url, url
+        commit(function()
+            if importedState then state = importedState
+            else state.aspect = constrain("aspect", imageSize.X / imageSize.Y) end
+        end)
+        if old and old ~= editable then old:Destroy() end
+        notify(readOK and "Image loaded" or "Image loaded; pixel reads unavailable", not readOK)
+    end)
+end
+
+local function imageUV(ray)
+    if not ray or not editable then return nil end
+    local origin = plane.CFrame:PointToObjectSpace(ray.Origin)
+    local direction = plane.CFrame:VectorToObjectSpace(ray.Direction)
+    if direction.Z <= 1e-7 then return nil end -- Only the upward-facing image side.
+    local distance = (-CONFIG.Thickness / 2 - origin.Z) / direction.Z
+    if distance < 0 or distance > CONFIG.RayDistance then return nil end
+    local point = origin + direction * distance
+    local u, v = point.X / plane.Size.X + 0.5, 0.5 - point.Y / plane.Size.Y
+    if u < 0 or u >= 1 or v < 0 or v >= 1 then return nil end
+    if not state.onTop then
+        local obstruction = raycast(ray.Origin, ray.Direction * math.max(0, distance - 0.005))
+        if obstruction then return nil end
+    end
+    return u, v
+end
+local function previewUV(point)
+    if not imageSize or collapsed or not over(preview, point) or not over(scroll, point) then return nil end
+    local pos, size = preview.AbsolutePosition, preview.AbsoluteSize
+    local scale = math.min(size.X / imageSize.X, size.Y / imageSize.Y)
+    local display = imageSize * scale
+    local start = pos + (size - display) / 2
+    local u, v = (point.X - start.X) / display.X, (point.Y - start.Y) / display.Y
+    if u < 0 or u >= 1 or v < 0 or v >= 1 then return nil end
+    return u, v
+end
+local function publishColor(r, g, b, description)
+    lastHex = string.format("#%02X%02X%02X", r, g, b)
+    hexBox.Text = lastHex
+    swatch.BackgroundColor3 = Color3.fromRGB(r, g, b)
+    sampleLabel.Text = description
+    copyText(lastHex, "Copied " .. lastHex)
+end
+local function sample()
+    local point = UIS:GetMouseLocation()
+    local ray = cursorRay()
+    local u, v
+    if panel.Visible and not collapsed then u, v = previewUV(point) end
+    if not u and overUI(point) then notify("Hover the image preview or the world image", true) return end
+    if not u then u, v = imageUV(ray) end
+    if u then
+        if not pixels then notify("This parser/runtime did not allow pixel reads", true) return end
+        local x = math.clamp(math.floor(u * imageSize.X), 0, imageSize.X - 1)
+        local y = math.clamp(math.floor(v * imageSize.Y), 0, imageSize.Y - 1)
+        local index = (y * imageSize.X + x) * 4
+        local r, g, b, a = buffer.readu8(pixels, index), buffer.readu8(pixels, index + 1),
+            buffer.readu8(pixels, index + 2), buffer.readu8(pixels, index + 3)
+        publishColor(r, g, b, string.format("Image pixel %d, %d | alpha %d/255", x, y, a))
+        return
+    end
+    if state.partFallback and ray then
+        local hit = raycast(ray.Origin, ray.Direction * CONFIG.RayDistance)
+        if hit and hit.Instance:IsA("BasePart") then
+            local color = hit.Instance.Color
+            publishColor(math.round(color.R * 255), math.round(color.G * 255), math.round(color.B * 255), "Part base color: " .. hit.Instance.Name)
+            return
+        end
+    end
+    notify("No image pixel under cursor", true)
+end
+
+local function bind(name, keys, callback)
+    local fullName = "GroundImageOverlay_" .. name
+    table.insert(actionNames, fullName)
+    CAS:BindActionAtPriority(fullName, callback, false, Enum.ContextActionPriority.High.Value + 10, table.unpack(keys))
+end
+bind("Hotkeys", {Enum.KeyCode.C, Enum.KeyCode.E, Enum.KeyCode.P, Enum.KeyCode.RightShift, Enum.KeyCode.Escape}, function(_, inputState, input)
+    local key = input.KeyCode
+    if key == Enum.KeyCode.C and (inputState == Enum.UserInputState.End or inputState == Enum.UserInputState.Cancel) then
+        heldC = false
+        refresh()
+        return Enum.ContextActionResult.Pass
+    end
+    if UIS:GetFocusedTextBox() then return Enum.ContextActionResult.Pass end
+    if inputState ~= Enum.UserInputState.Begin then return Enum.ContextActionResult.Pass end
+    if key == Enum.KeyCode.C then heldC = true refresh()
+    elseif key == Enum.KeyCode.E then sample()
+    elseif key == Enum.KeyCode.P then beginPlace()
+    elseif key == Enum.KeyCode.RightShift then panel.Visible = not panel.Visible
+    elseif key == Enum.KeyCode.Escape and placing then cancelPlace()
+    else return Enum.ContextActionResult.Pass end
+    return Enum.ContextActionResult.Sink
+end)
+bind("Placement", {Enum.UserInputType.MouseButton1, Enum.UserInputType.MouseButton2}, function(_, inputState, input)
+    if not placing or overUI(UIS:GetMouseLocation()) then return Enum.ContextActionResult.Pass end
+    if inputState == Enum.UserInputState.Begin then
+        if input.UserInputType == Enum.UserInputType.MouseButton2 then cancelPlace()
+        else
+            local ray = cursorRay()
+            local hit = ray and raycast(ray.Origin, ray.Direction * CONFIG.RayDistance)
+            if hit then
+                setPosition(hit.Position)
+                record(placeBefore)
+                placing, placeBefore = false, nil
+                refresh()
+                notify("Image placed")
+            else notify("Point at a surface before placing", true) end
+        end
+    end
+    return Enum.ContextActionResult.Sink
+end)
+connect(UIS.WindowFocusReleased, function()
+    windowFocused = false
+    panelCursor.Visible = false
+    heldC = false
+    if sliderDrag then record(sliderDrag.before) end
+    sliderDrag, panelDrag = nil, nil
+    refresh()
+end)
+connect(UIS.WindowFocused, function()
+    windowFocused = true
+    updatePanelCursor()
+end)
+connect(header.InputBegan, function(input)
+    if input.UserInputType ~= Enum.UserInputType.MouseButton1 and input.UserInputType ~= Enum.UserInputType.Touch then return end
+    local point = Vector2.new(input.Position.X, input.Position.Y)
+    if point.X >= header.AbsolutePosition.X + header.AbsoluteSize.X - 80 then return end
+    panelDrag = {point = point, position = panel.Position, input = input}
+end)
+connect(UIS.InputChanged, function(input)
+    local mouse = input.UserInputType == Enum.UserInputType.MouseMovement
+    if not mouse and input.UserInputType ~= Enum.UserInputType.Touch then return end
+    local point = Vector2.new(input.Position.X, input.Position.Y)
+    if sliderDrag and (mouse or input == sliderDrag.input) then sliderDrag.update(point) end
+    if panelDrag and (mouse or input == panelDrag.input) then
+        local delta = point - panelDrag.point
+        panel.Position = UDim2.fromOffset(panelDrag.position.X.Offset + delta.X, panelDrag.position.Y.Offset + delta.Y)
+        fitPanel()
+    end
+end)
+connect(UIS.InputEnded, function(input)
+    local mouseEnd = input.UserInputType == Enum.UserInputType.MouseButton1
+    if sliderDrag and (mouseEnd or input == sliderDrag.input) then
+        record(sliderDrag.before)
+        sliderDrag = nil
+    end
+    if panelDrag and (mouseEnd or input == panelDrag.input) then panelDrag = nil end
+end)
+local elapsed = 0
+connect(RunService.RenderStepped, function(dt)
+    updatePanelCursor()
+    if placing then
+        local ray = cursorRay()
+        local hit = ray and not overUI(UIS:GetMouseLocation()) and raycast(ray.Origin, ray.Direction * CONFIG.RayDistance)
+        if hit then setPosition(hit.Position) refresh() end
+    end
+    elapsed = elapsed + dt
+    if elapsed >= 0.25 then elapsed = 0 fitPanel() end
+end)
+cleanup = function()
+    if not alive then return end
+    alive = false
+    loadVersion = loadVersion + 1
+    for _, name in ipairs(actionNames) do CAS:UnbindAction(name) end
+    for _, connection in ipairs(connections) do connection:Disconnect() end
+    gui:Destroy()
+    folder:Destroy()
+    if editable then editable:Destroy() end
+    editable, pixels = nil, nil
+    if env[singletonKey] == cleanup then env[singletonKey] = nil end
+end
+env[singletonKey] = cleanup
+refresh()
+underPlayer()
+history, future = {}, {}
+loadImage(sourceURL)
